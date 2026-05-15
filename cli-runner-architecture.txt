@@ -1,0 +1,230 @@
+app-runner: Detailed Architecture and File Roles
+
+Overview
+--------
+app-runner is a lightweight Python CLI that automates two main workflows for Java projects:
+
+1) Run mode:
+- Detect Maven or Gradle project.
+- Prefer wrapper scripts (mvnw/gradlew).
+- Run Spring Boot (`spring-boot:run` or `bootRun`).
+- Stream logs and detect success/failure patterns.
+
+2) Rewrite mode:
+- Inject OpenRewrite plugin XML into `pom.xml` from a local `.txt` file.
+- Run `rewrite:dryRun`.
+- Capture migration warnings into `migration units.txt`.
+
+The tool does not use IntelliJ APIs and does not use any LLM.
+
+
+High-Level Flow
+---------------
+1. CLI parses arguments.
+2. Project detection finds build tool and base command.
+3. If `--rewrite-plugin-txt` is provided:
+   - validate Maven project
+   - inject plugin into target `pom.xml`
+   - run `rewrite:dryRun`
+   - extract warning/change lines
+   - write `migration units.txt`
+4. Otherwise:
+   - build Spring Boot run command
+   - execute process
+   - classify logs as success/failure
+5. Print clear terminal outcome and exit code.
+
+
+Main Files and Their Roles
+--------------------------
+
+1) `pyproject.toml`
+- Defines package metadata (name/version/entrypoint).
+- Registers console command:
+  - `app-runner = app_runner.cli:main`
+- Enables editable install with:
+  - `python -m pip install -e .`
+
+
+2) `README.md`
+- User-facing usage guide.
+- Documents run mode and rewrite mode.
+- Shows key flags (`--module`, `--main-class`, `--rewrite-plugin-txt`, etc.).
+
+
+3) `src/app_runner/__main__.py`
+- Module entrypoint for:
+  - `python -m app_runner ...`
+- Delegates directly to `cli.main()`.
+
+
+4) `src/app_runner/__init__.py`
+- Package init and version marker.
+
+
+5) `src/app_runner/cli.py`
+- Core orchestration layer.
+- Responsibilities:
+  - define all CLI arguments
+  - call detection logic
+  - build Maven/Gradle commands
+  - switch between run mode and rewrite mode
+  - print consistent terminal result messages
+  - write migration warnings report in rewrite mode
+
+- Key responsibilities by function:
+  - `main(...)`: entrypoint; parse args; detect project; route workflow.
+  - `_build_parser()`: central place for CLI flags.
+  - `_build_command(...)`: constructs Spring Boot run command (supports Maven module and main-class overrides).
+  - `_run_rewrite_mode(...)`: plugin injection + `rewrite:dryRun` execution path.
+  - `_extract_migration_warnings(...)`: pulls warning/change blocks from process output.
+  - `_write_migration_units_file(...)`: writes `migration units.txt` at repo root.
+  - `_print_final_result(...)` and `_print_rewrite_result(...)`: clear success/failure summaries.
+
+
+6) `src/app_runner/detection.py`
+- Project/build-system detection.
+- Responsibilities:
+  - verify project path exists and is a directory
+  - detect Maven via `pom.xml`
+  - detect Gradle via `build.gradle`, `build.gradle.kts`, `settings.gradle`, `settings.gradle.kts`
+  - prefer wrappers (`mvnw`, `gradlew`; Windows variants included)
+  - resolve system commands (`mvn.cmd`, `gradle.bat`, etc.) if wrappers do not exist
+
+- Main types:
+  - `BuildTool`: enum (`maven`, `gradle`)
+  - `ProjectInfo`: immutable info object used by CLI
+  - `ProjectDetectionError`: validation/detection failure
+
+
+7) `src/app_runner/runner.py`
+- Process execution engine.
+- Responsibilities:
+  - spawn external process with stdout/stderr pipes
+  - consume output concurrently from both streams using threads + queue
+  - support timeout
+  - support graceful terminate/kill behavior
+  - call line classifier continuously while output is streaming
+  - return structured `RunResult`
+
+- Main types/functions:
+  - `RunResult`: classification + exit code + captured stdout/stderr
+  - `run_until_result(...)`: central runtime loop
+  - `_terminate(...)`: controlled process shutdown
+  - helper functions for draining queues and closing streams safely
+
+
+8) `src/app_runner/classifier.py`
+- Pattern-based output classifier for startup/build failures.
+- Responsibilities:
+  - detect success signals (`Started ...`, `Tomcat started on port`, etc.)
+  - detect known failure classes:
+    - port in use
+    - main class missing
+    - compilation errors
+    - missing/invalid configuration
+    - dependency resolution errors
+    - Java version mismatch
+    - timeout/process-exited/unknown
+
+- Main types:
+  - `ResultKind`: enum of outcome categories
+  - `Classification`: normalized result (kind/message/matched line)
+
+
+9) `src/app_runner/rewrite.py`
+- OpenRewrite preparation logic.
+- Responsibilities:
+  - locate target `pom.xml` (root or module-specific)
+  - load plugin XML from local `.txt`
+  - validate plugin format (`<plugin>...</plugin>`)
+  - upsert plugin into `<build><plugins>`
+  - preserve/handle XML namespace correctly
+  - optional backup creation (`pom.xml.bak`)
+  - build rewrite command (`mvn ... rewrite:dryRun`)
+
+- Main types:
+  - `RewritePreparation`: result of injection step
+  - `RewriteError`: rewrite-specific validation/runtime issue
+
+
+10) `tests/helpers.py`
+- Test helper utilities (workspace-safe temp directories).
+- Keeps tests compatible with sandbox restrictions.
+
+
+11) `tests/test_detection.py`
+- Verifies build tool detection behavior:
+  - Maven detection
+  - Gradle detection
+  - wrapper preference
+  - unknown project error
+
+
+12) `tests/test_runner.py`
+- Verifies process runner behavior:
+  - startup success detection path
+  - timeout path
+
+
+13) `tests/test_classifier.py`
+- Verifies classification patterns:
+  - success pattern
+  - port-in-use
+  - Java mismatch
+  - main-class-not-found
+  - unrelated line ignored
+
+
+14) `tests/test_cli.py`
+- Verifies CLI command composition and warning extraction behavior.
+
+
+15) `tests/test_rewrite.py`
+- Verifies rewrite preparation behavior:
+  - plugin injection into pom
+  - backup creation
+  - rewrite command generation
+
+
+Data and Output Files
+---------------------
+
+1) `migration units.txt`
+- Generated in rewrite mode after `rewrite:dryRun`.
+- Contains warning/change lines captured from process output.
+- Overwritten on each run.
+
+2) `pom.xml.bak` (inside target project)
+- Created before plugin injection unless `--no-pom-backup` is used.
+- Safety copy of target pom.
+
+
+Behavior Notes
+--------------
+- Run mode is optimized for reliability and readable terminal diagnostics.
+- Rewrite mode is scoped to Maven projects.
+- Module targeting for Maven uses:
+  - `-f <module>/pom.xml`
+  This avoids running goals on parent aggregator poms unintentionally.
+- Exit codes:
+  - `0`: success
+  - `1`: operational failure
+  - `2`: usage/detection/preparation error
+
+
+Typical Commands
+----------------
+
+Run Spring app:
+`app-runner C:\path\to\project --timeout 120`
+
+Run module:
+`app-runner C:\path\to\project --module app-module --timeout 120`
+
+Rewrite dry run with plugin injection:
+`app-runner C:\path\to\legacy --rewrite-plugin-txt C:\path\to\plugin.txt --timeout 300`
+
+Rewrite dry run for module:
+`app-runner C:\path\to\legacy --module app-module --rewrite-plugin-txt C:\path\to\plugin.txt --timeout 300`
+
